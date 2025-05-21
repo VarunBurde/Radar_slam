@@ -1,13 +1,16 @@
 import pandas as pd
 
-# Load your radar data
-df = pd.read_csv("side_radars_corrected_transformation.csv")  # Replace with your actual filename
+# Load the radar data from CSV
+df = pd.read_csv("csv_data/side_radars_corrected_transformation.csv")
 
-# Use the same logic as the 20ms binning, but with 5ms bins
-t0 = df["timestamp"].min()  # starting timestamp
-df["frame_id"] = ((df["timestamp"] - t0) // 1).astype(int)  # 5ms = 0.005 seconds
+# Get the starting timestamp to use as a reference point
+t0 = df["timestamp"].min()
 
-# Save the new DataFrame
-df.to_csv("side_radars_binned_051ms.csv", index=False)
+# Create frame_id by grouping timestamps into 1ms bins
+# This allows grouping radar points that arrived at similar times
+df["frame_id"] = ((df["timestamp"] - t0) // 1).astype(int)  # 1ms bins
 
-print("Done! Frame IDs assigned every 5ms like the 20ms version.")
+# Save the new DataFrame with frame_id assignments
+df.to_csv("csv_data/side_radars_binned_051ms.csv", index=False)
+
+print("Done! Frame IDs assigned with 1ms binning.")

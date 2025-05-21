@@ -1,104 +1,87 @@
-# import pandas as pd
-# import matplotlib.pyplot as plt
-# import numpy as np
-
-# # Load your dataset
-# df = pd.read_csv("side_radars_binned_20ms.csv")
-
-# # Normalize frame IDs to a range (0 to 1) for color mapping
-# frame_ids = df["frame_id"]
-# frame_id_min = frame_ids.min()
-# frame_id_max = frame_ids.max()
-# normed_frame_ids = (frame_ids - frame_id_min) / (frame_id_max - frame_id_min)
-
-# # Create a colormap (e.g., 'viridis' or 'hsv')
-# cmap = plt.cm.get_cmap("hsv")
-
-# # Map normalized frame_id values to colors
-# colors = cmap(normed_frame_ids)
-
-# # Plot all points with color based on their frame ID
-# plt.figure(figsize=(12, 8))
-# plt.scatter(df["meas_pos_x"], df["meas_pos_y"], c=colors, s=3, alpha=0.6)
-
-# plt.title("Radar Points by Frame ID")
-# plt.xlabel("X (meters)")
-# plt.ylabel("Y (meters)")
-# plt.axis("equal")
-# plt.grid(True)
-# # plt.colorbar(label="Normalized Frame ID")
-# plt.tight_layout()
-# plt.show()
-
-
 import pandas as pd
 import numpy as np
 import open3d as o3d
 import matplotlib.pyplot as plt
 from scipy.spatial.transform import Rotation as R
 
-# Load your binned radar data
-df = pd.read_csv("side_radars_binned_051ms.csv")
+"""
+Simple SLAM implementation using radar point clouds:
+1. Load radar data binned by time
+2. For each consecutive frame, perform point cloud registration (ICP)
+3. Accumulate transformations to build a global map
+4. Visualize the trajectory and point cloud map
+"""
 
-# Normalize frame_id values to range [0, 1] for coloring
+# Load radar point cloud data with time-binned frames
+df = pd.read_csv("csv_data/side_radars_binned_051ms.csv")
+
+# Get frame ID range
 frame_ids = df["frame_id"]
 frame_min = frame_ids.min()
 frame_max = frame_ids.max()
 
-transform_frames = []
+# Initialize variables for SLAM
+transform_frames = []  # List to store coordinate frames for visualization
 world_coordinate_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=2.0, origin=[0, 0, 0])
-transform_frames.append(world_coordinate_frame)
-robot_position = np.eye(4)
-last_transform = np.eye(4)
+transform_frames.append(world_coordinate_frame)  # Add world coordinate frame as reference
+
+# Robot pose in world coordinates (starting with identity matrix)
+robot_position = np.eye(4)  
+last_transform = np.eye(4)  # Previous frame-to-frame transform for initialization
+
+# Initialize global point cloud map
 pcd_main = o3d.geometry.PointCloud()
 pcd_main.points = o3d.utility.Vector3dVector([])
 
-for i in range(0, len(df["frame_id"].unique())-1):
-    print(i)
-    # Filter points for frame_id 0 and 1
+# Process all frames (except the last one)
+unique_frames = df["frame_id"].unique()
+for i in range(0, len(unique_frames)-1):
+    print(f"Processing frame {i}/{len(unique_frames)-1}")
+    
+    # STEP 1: Get point cloud from current frame
     filtered_df_1 = df[df["frame_id"].isin([i])]
-
-    # Extract XYZ points
     points_1 = filtered_df_1[["meas_pos_x", "meas_pos_y", "meas_pos_z"]].values
-
-    # Create the point cloud
     pcd1 = o3d.geometry.PointCloud()
     pcd1.points = o3d.utility.Vector3dVector(points_1)
 
-    # Filter points for frame_id 0 and 1
+    # STEP 2: Get point cloud from next frame
     filtered_df_2 = df[df["frame_id"].isin([i+1])]
-
-    # Extract XYZ points
     points_2 = filtered_df_2[["meas_pos_x", "meas_pos_y", "meas_pos_z"]].values
-
-    # Create the point cloud
     pcd2 = o3d.geometry.PointCloud()
     pcd2.points = o3d.utility.Vector3dVector(points_2)
 
-    threshold = 1.0
-    trans_init = last_transform
+    # STEP 3: Perform point cloud registration (ICP)
+    # Find transformation that aligns current frame with previous frame
+    threshold = 1.0  # Maximum correspondence distance
+    trans_init = last_transform  # Use previous transform as initial guess
     reg_p2p = o3d.pipelines.registration.registration_icp(
-    pcd1, pcd2, threshold, trans_init,
-    o3d.pipelines.registration.TransformationEstimationPointToPoint())
+        pcd1, pcd2, threshold, trans_init,
+        o3d.pipelines.registration.TransformationEstimationPointToPoint())
 
-    # Create a coordinate frame to visualize the transformation
+    # STEP 4: Update SLAM state
+    # Create a coordinate frame to visualize the robot's pose
     coordinate_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=1.0, origin=[0, 0, 0])
-
-    last_transform = reg_p2p.transformation
+    
+    # Update the transformation matrices
+    last_transform = reg_p2p.transformation  # Save current transform for next iteration
+    # Update the global robot position by composing the inverse of the current transform
+    # (We use inverse because ICP gives us source->target, but we need target->source for SLAM)
     robot_position = robot_position @ np.linalg.inv(reg_p2p.transformation)
 
+    # STEP 5: Transform point cloud to global coordinates
     pcd2.transform(robot_position)
+    
+    # STEP 6: Update visualization elements
+    coordinate_frame.transform(robot_position)  # Move coordinate frame to current robot pose
+    pcd_main.points.extend(pcd2.points)  # Add current frame points to global map
+    transform_frames.append(coordinate_frame)  # Add current frame's coordinate system
+    print(f"Robot position matrix:\n{robot_position}")
 
-    coordinate_frame.transform(robot_position)
-    pcd_main.points.extend(pcd2.points)
-
-    transform_frames.append(coordinate_frame)
-    print(robot_position)
-
-
-
-pcd_main.paint_uniform_color([1.0, 0.0, 0.0])  # Set color for the main point cloud
+# Set color for the global point cloud
+pcd_main.paint_uniform_color([1.0, 0.0, 0.0])  # Red color
 transform_frames.append(pcd_main)
+
+# Visualize the complete SLAM result
 o3d.visualization.draw_geometries(transform_frames)
 
 
