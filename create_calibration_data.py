@@ -1,13 +1,30 @@
-rosbag_path = "/media/varun/Vision_projects/projects/lawn_mower/smaut_calibration_data/rviz_auto_bag_20250409_143636_0.db3"
-realsense_path = "/media/varun/Vision_projects/projects/lawn_mower/smaut_calibration_data/realsense_record_20250409_143552.bag"
+# Standard library imports
+import os
+import json
+import yaml
+import shutil
+import struct
+import subprocess
+import traceback
+from datetime import datetime
 
+# Third-party imports 
+import numpy as np
+import cv2
+import pyrealsense2 as rs
+from scipy.spatial.transform import Rotation as R
 
+# ROS2 related imports
 import rclpy
 from rclpy.serialization import deserialize_message
 import rosbag2_py
 from rosidl_runtime_py.utilities import get_message
-import yaml
-import os
+from sensor_msgs_py.point_cloud2 import read_points
+
+# File paths
+rosbag_path = "/media/varun/Vision_projects/projects/lawn_mower/smaut_calibration_data/rviz_auto_bag_20250409_143636_0.db3"
+realsense_path = "/media/varun/Vision_projects/projects/lawn_mower/smaut_calibration_data/realsense_record_20250409_143552.bag"
+
 
 def read_rosbag(bag_path, target_topic=None, message_type=None):
     # Initialize the reader
@@ -129,13 +146,6 @@ def read_realsense_rgb(bag_file_path, output_folder=None, max_frames=10):
         output_folder: Optional folder to save images
         max_frames: Maximum number of frames to extract
     """
-    # Import required libraries for RealSense processing
-    import pyrealsense2 as rs
-    import numpy as np
-    import cv2
-    import os
-    import subprocess
-    
     # Create output folder if specified
     if output_folder:
         os.makedirs(output_folder, exist_ok=True)
@@ -190,7 +200,7 @@ def read_realsense_rgb(bag_file_path, output_folder=None, max_frames=10):
                     color_image = np.asanyarray(color_frame.get_data())
                     
                     # RealSense uses RGB format, convert to BGR for OpenCV
-                    color_image_bgr = cv2.cvtColor(color_image, cv2.COLOR_RGB2BGR)
+                    color_image_bgr = color_image
                     
                     # Save the frame information
                     rgb_frames.append({
@@ -367,10 +377,6 @@ def find_closest_messages(reference_frames, target_messages, max_time_diff_ms=10
 
 def save_synchronized_data(matched_pairs, output_folder):
     """Save the synchronized RGB and point cloud data"""
-    import os
-    import json
-    import numpy as np
-    
     os.makedirs(output_folder, exist_ok=True)
     
     # Prepare data for saving
@@ -508,12 +514,109 @@ def save_pointcloud_as_pcd(pointcloud_msg, output_path):
         traceback.print_exc()
         return False
 
-def create_calibration_json_files(output_folder):
+def extract_realsense_intrinsics(bag_file_path):
+    """
+    Extract intrinsic parameters from a RealSense bag file
+    
+    Args:
+        bag_file_path: Path to the RealSense .bag file
+        
+    Returns:
+        dict: Camera intrinsic parameters or None if extraction fails
+    """
+    import pyrealsense2 as rs
+    
+    print("Extracting camera intrinsics from RealSense bag file...")
+    
+    try:
+        # Create a context and load the device from file
+        ctx = rs.context()
+        device = ctx.load_device(bag_file_path)
+        
+        # Get the list of sensors in the device
+        sensors = device.query_sensors()
+        
+        # Find the RGB/color sensor
+        color_sensor = None
+        for sensor in sensors:
+            if sensor.get_info(rs.camera_info.name) == "RGB Camera":
+                color_sensor = sensor
+                break
+        
+        if not color_sensor:
+            print("Could not find RGB camera in the bag file")
+            return None
+        
+        # Get the color sensor's stream profile
+        stream_profiles = color_sensor.get_stream_profiles()
+        color_profile = None
+        
+        for profile in stream_profiles:
+            if profile.stream_type() == rs.stream.color:
+                video_profile = profile.as_video_stream_profile()
+                color_profile = profile
+                break
+        
+        if not color_profile:
+            print("Could not find color stream profile")
+            return None
+        
+        # Get the intrinsics
+        video_profile = color_profile.as_video_stream_profile()
+        intrinsics = video_profile.get_intrinsics()
+        
+        # Extract resolution
+        width = intrinsics.width
+        height = intrinsics.height
+        
+        # Extract intrinsic matrix parameters
+        fx = intrinsics.fx
+        fy = intrinsics.fy
+        ppx = intrinsics.ppx
+        ppy = intrinsics.ppy
+        
+        # Extract distortion parameters
+        distortion_model = intrinsics.model
+        distortion_coeffs = intrinsics.coeffs
+        
+        print(f"Successfully extracted camera intrinsics:")
+        print(f"Resolution: {width}x{height}")
+        print(f"Focal lengths: fx={fx}, fy={fy}")
+        print(f"Principal point: ppx={ppx}, ppy={ppy}")
+        print(f"Distortion model: {distortion_model}")
+        print(f"Distortion coefficients: {distortion_coeffs}")
+        
+        # Return the intrinsic parameters in a structured format
+        return {
+            "resolution": {
+                "width": width,
+                "height": height
+            },
+            "intrinsic_matrix": {
+                "fx": fx,
+                "fy": fy,
+                "ppx": ppx,
+                "ppy": ppy
+            },
+            "distortion": {
+                "model": str(distortion_model),
+                "coeffs": distortion_coeffs
+            }
+        }
+        
+    except Exception as e:
+        print(f"Error extracting camera intrinsics: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+def create_calibration_json_files(output_folder, camera_intrinsics=None):
     """
     Create calibration JSON files in the required format
     
     Args:
         output_folder: Folder to save the JSON files
+        camera_intrinsics: Optional camera intrinsic parameters extracted from RealSense
         
     Returns:
         List of paths to the created JSON files
@@ -555,7 +658,44 @@ def create_calibration_json_files(output_folder):
         }
     }
     
-    # Create extrinsic calibration JSON
+    # Update intrinsic parameters if available from RealSense
+    if camera_intrinsics:
+        # Update resolution
+        if "resolution" in camera_intrinsics:
+            intrinsic_data["center_camera-intrinsic"]["param"]["img_dist_w"] = camera_intrinsics["resolution"]["width"]
+            intrinsic_data["center_camera-intrinsic"]["param"]["img_dist_h"] = camera_intrinsics["resolution"]["height"]
+        
+        # Update camera matrix
+        if "intrinsic_matrix" in camera_intrinsics:
+            matrix = camera_intrinsics["intrinsic_matrix"]
+            intrinsic_data["center_camera-intrinsic"]["param"]["cam_K"]["data"] = [
+                [matrix["fx"], 0, matrix["ppx"]],
+                [0, matrix["fy"], matrix["ppy"]],
+                [0, 0, 1]
+            ]
+        
+        # Update distortion coefficients
+        if "distortion" in camera_intrinsics and "coeffs" in camera_intrinsics["distortion"]:
+            coeffs = camera_intrinsics["distortion"]["coeffs"]
+            # Convert to the required format - assuming Brown-Conrady model with k1, k2, p1, p2
+            if len(coeffs) >= 4:
+                intrinsic_data["center_camera-intrinsic"]["param"]["cam_dist"]["data"] = [
+                    [coeffs[0], coeffs[1], coeffs[2], coeffs[3]]
+                ]
+            elif len(coeffs) == 5:  # Include k3 if available
+                intrinsic_data["center_camera-intrinsic"]["param"]["cam_dist"]["data"] = [
+                    [coeffs[0], coeffs[1], coeffs[2], coeffs[3], coeffs[4]]
+                ]
+    
+
+    extrinsics = np.eye(4, dtype=float)  # Default to identity matrix
+    extrinsics_rotation = R.from_euler('zyx', [-30,0,90], degrees=True)  # Example rotation around Z-axis
+    extrinsics_translation = np.array([0.00, -0.09, -0.13]) 
+    extrinsics[:3, :3] = extrinsics_rotation.as_matrix()  # Set rotation
+    extrinsics[:3, 3] = extrinsics_translation  # Set translation
+
+    
+    # Create extrinsic calibration JSON with values from physical measurements
     extrinsic_data = {
         "top_center_lidar-to-center_camera-extrinsic": {
             "sensor_name": "top_center_lidar",
@@ -569,12 +709,7 @@ def create_calibration_json_files(output_folder):
                     "cols": 4,
                     "type": 6,
                     "continuous": True,
-                    "data": [
-                        [0.0125908, -0.999895, -0.00713773, -0.0322306],
-                        [0.0119283, 0.00728786, -0.999902, -0.352079],
-                        [0.99985, 0.0125045, 0.0120187, -0.574468],
-                        [0, 0, 0, 1]
-                    ]
+                    "data": extrinsics.tolist()
                 }
             }
         }
@@ -595,7 +730,7 @@ def create_calibration_json_files(output_folder):
     
     return [intrinsic_path, extrinsic_path]
 
-def create_calibration_folder(output_folder, rgb_frame=None, pointcloud_msg=None):
+def create_calibration_folder(output_folder, rgb_frame=None, pointcloud_msg=None, camera_intrinsics=None):
     """
     Create a folder with calibration data (one image, one point cloud, and two JSON files)
     
@@ -603,6 +738,7 @@ def create_calibration_folder(output_folder, rgb_frame=None, pointcloud_msg=None
         output_folder: Base folder for output
         rgb_frame: Dictionary with RGB image data
         pointcloud_msg: Dictionary with point cloud data
+        camera_intrinsics: Optional camera intrinsic parameters
     """
     import os
     import json
@@ -617,7 +753,7 @@ def create_calibration_folder(output_folder, rgb_frame=None, pointcloud_msg=None
     print(f"\nCreating calibration folder: {calib_folder}")
     
     # Create calibration JSON files directly in the folder
-    json_files = create_calibration_json_files(calib_folder)
+    json_files = create_calibration_json_files(calib_folder, camera_intrinsics)
     
     # Save image and point cloud
     result_files = {}
@@ -657,8 +793,13 @@ if __name__ == "__main__":
     output_folder = "/media/varun/Vision_projects/projects/lawn_mower/calibration_output"
     
     try:
-        # Step 1: Extract single RGB image from RealSense bag file
-        print("=== EXTRACTING RGB IMAGE ===")
+        # Step 1: Extract single RGB image from RealSense bag file and camera intrinsics
+        print("=== EXTRACTING RGB IMAGE AND CAMERA INTRINSICS ===")
+        
+        # Extract camera intrinsics
+        camera_intrinsics = extract_realsense_intrinsics(realsense_path)
+        
+        # Extract RGB frames
         rgb_frames = read_realsense_rgb(realsense_path, None, max_frames=1)
         
         if not rgb_frames:
@@ -695,14 +836,14 @@ if __name__ == "__main__":
         
         # Step 4: Create calibration folder with all required files
         print("\n=== CREATING CALIBRATION DATA FOLDER ===")
-        calibration_folder = create_calibration_folder(output_folder, rgb_frame, pointcloud_msg)
+        calibration_folder = create_calibration_folder(output_folder, rgb_frame, pointcloud_msg, camera_intrinsics)
         
         print(f"\nComplete! Calibration data saved to {calibration_folder}")
         print("Files saved:")
         print(f"  - Image: {os.path.join(calibration_folder, '0.png')}")
         print(f"  - Point Cloud: {os.path.join(calibration_folder, '0.pcd')}")
         print(f"  - Extrinsic JSON: {os.path.join(calibration_folder, 'top_center_lidar-to-center_camera-extrinsic.json')}")
-        print(f"  - Intrinsic JSON: {os.path.join(calibration_folder, 'center_camera-intrinsic.json')}")
+        print(f"  - Intrinsic JSON: {os.path.join(calibration_folder, 'center_camera-intrinsic.json')} (updated with RealSense parameters)")
         print(f"  - Summary: {os.path.join(calibration_folder, 'summary.json')}")
         
     except Exception as e:
